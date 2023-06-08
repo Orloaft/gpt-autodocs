@@ -1,21 +1,12 @@
-import ts from "typescript";
 import * as fs from "fs";
 import * as readline from "readline";
 import { ChatGPTAPI } from "chatgpt";
-import {
-  CLASS_PROMPT,
-  FIELD_PROMPT,
-  FUNC_PROMPT,
-  INTERFACE_PROMPT,
-  TYPE_PROMPT,
-} from "./prompts.js";
 
 if (!process.env.CHATGPT_API_KEY) {
   throw new Error(
     "You need to set CHATGPT_API_KEY with a GPT API key. If a hassle, you can bug Adam for his."
   );
 }
-let remainingUpdates = process.env.CHATGPT_UPDATES ? +process.env.CHATGPT_UPDATES : 1;
 
 export const api = new ChatGPTAPI({
   apiKey: process.env.CHATGPT_API_KEY,
@@ -25,166 +16,92 @@ export const api = new ChatGPTAPI({
   maxModelTokens: 7192, // Must equal maxModelTokens + maxReponseTokens <= 8192
   maxResponseTokens: 1000,
 });
-
-function extractSnippet(sourceCode: string, pos: number) {
-  const maxLength = 7192 * 3;
-  const halfLength = Math.floor(maxLength / 2);
-
-  if (sourceCode.length <= maxLength) {
-    return sourceCode;
-  }
-
-  let start = pos - halfLength;
-  let end = pos + halfLength;
-
-  if (start < 0) {
-    end -= start;
-    start = 0;
-  }
-
-  if (end > sourceCode.length) {
-    const diff = end - sourceCode.length;
-    start -= diff;
-    end = sourceCode.length;
-    if (start < 0) {
-      start = 0;
-    }
-  }
-
-  return sourceCode.substring(start, end);
-}
-
-let sourceCode: string;
-async function getAIResult(position: number, prompt: string) {
+const MAX_CODE_CHUNK_SIZE = 5000; // Maximum size of each code chunk
+async function makeChatGPTRequest(
+  sourceCode: string,
+  additionalPrompt: string
+): Promise<string> {
+  // Combine the default prompt with the additional prompt
+  const prompt = `please generate a relevant comment for each <comment here> tag in provided code and return a re-written version of the code where each tag is replaced with the corresponding comment.Do not add any additional words before the code. ${additionalPrompt}`;
   let writeLength = 0;
-  const sourceCodeSnippet = extractSnippet(sourceCode, position);
-  const res = await api.sendMessage(prompt, {
-    systemMessage: `Work on this source code: ${sourceCodeSnippet}`,
-    onProgress(partialResponse) {
-      let output = partialResponse.text;
-      let newOutput = output.substring(writeLength);
-      writeLength = output.length;
-      process.stdout.write(newOutput);
-    },
-  });
-  return res.text;
-}
+  try {
+    // Split the source code into smaller chunks
+    const codeChunks: string[] = [];
+    let chunkStart = 0;
+    while (chunkStart < sourceCode.length) {
+      const chunkEnd = Math.min(
+        chunkStart + MAX_CODE_CHUNK_SIZE,
+        sourceCode.length
+      );
+      const codeChunk = sourceCode.substring(chunkStart, chunkEnd);
+      codeChunks.push(codeChunk);
+      chunkStart = chunkEnd;
+    }
 
-const promiseQueue: Array<
-  () => Promise<{ pos: number; jsdoc: string } | null>
-> = [];
-
-function addJSDoc(node: ts.Node, sourceFile: ts.SourceFile) {
-  const conditionPromptPairs = [
-    [ts.isClassDeclaration(node), CLASS_PROMPT],
-    [ts.isMethodDeclaration(node), FUNC_PROMPT],
-    [ts.isFunctionDeclaration(node), FUNC_PROMPT],
-    [ts.isInterfaceDeclaration(node), INTERFACE_PROMPT],
-    [ts.isPropertyDeclaration(node), FIELD_PROMPT],
-    [ts.isPropertySignature(node), FIELD_PROMPT],
-    [ts.isParameterPropertyDeclaration(node, node.parent), FIELD_PROMPT],
-    [ts.isTypeAliasDeclaration(node), TYPE_PROMPT],
-  ] as const;
-  for (const [cond, promptFn] of conditionPromptPairs) {
-    if (cond) {
-      const name = (node as any).name?.getText(sourceFile);
-      if (!name) {
-        return;
-      }
-      // Hacky code to narrow down to public fields
-      if (
-        ts.isPropertyDeclaration(node) ||
-        ts.isParameterPropertyDeclaration(node, node.parent)
-      ) {
-        let isPublic = false;
-        for (const modifier of node.modifiers || []) {
-          if (modifier.kind === ts.SyntaxKind.PublicKeyword) {
-            isPublic = true;
-            break;
-          }
-        }
-        if (!isPublic) {
-          return;
-        }
-      }
-
-      promiseQueue.push(async () => {
-        const existingJSDoc = ts.getLeadingCommentRanges(sourceCode, node.pos);
-
-        if (!existingJSDoc || existingJSDoc.length === 0) {
-          const jsdoc = (await getAIResult(node.pos, promptFn(name))).trim();
-          return { pos: node.pos, jsdoc };
-        }
-        return null;
+    // Process each code chunk separately
+    const responsePromises = codeChunks.map(async (chunk) => {
+      const response = await api.sendMessage(prompt, {
+        systemMessage: `this is the provided code:${chunk}`,
+        onProgress(partialResponse) {
+          let output = partialResponse.text;
+          let newOutput = output.substring(writeLength);
+          writeLength = output.length;
+          process.stdout.write(newOutput);
+        },
       });
-    }
-  }
+      return response.text;
+    });
 
-  ts.forEachChild(node, (childNode) => addJSDoc(childNode, sourceFile));
+    // Wait for all responses
+    const responses = await Promise.all(responsePromises);
+
+    // Concatenate the responses
+    let annotatedCode = responses.join("");
+
+    // Remove the introductory text
+    const codeBlockMarker = "```";
+    const languageMarkerIndex = annotatedCode.indexOf(codeBlockMarker);
+    if (languageMarkerIndex !== -1) {
+      const start = languageMarkerIndex + codeBlockMarker.length;
+      annotatedCode = annotatedCode.substring(start);
+    }
+
+    return annotatedCode;
+  } catch (error) {
+    console.error("ChatGPT request failed:", error);
+    return ""; // Return an empty string if the request fails
+  }
 }
 
-async function updateSourceFile(sourceFilePath: string) {
-  sourceCode = fs.readFileSync(sourceFilePath).toString();
-  const sourceFile = ts.createSourceFile(
-    sourceFilePath,
-    sourceCode,
-    ts.ScriptTarget.ESNext,
-    true
-  );
-  promiseQueue.length = 0;
-
-  addJSDoc(sourceFile, sourceFile);
-
-  const jsdocUpdates: any[] = [];
-  for (const p of promiseQueue) {
-    if (remainingUpdates > 0) {
-      const update = await p();
-      if (update) {
-          jsdocUpdates.push(update);
-          remainingUpdates--;
-      }
-    }
-  }
-
-  // Sort updates by position in descending order
-  jsdocUpdates.sort((a, b) => b.pos - a.pos);
-
-  // Apply updates to the source code
-  for (const { pos, jsdoc } of jsdocUpdates) {
-    // Find the first non-whitespace character before the node position
-    let adjustedPos = pos;
-    while (adjustedPos > 0 && /\s/.test(sourceCode[adjustedPos])) {
-      adjustedPos++;
-    }
-
-    sourceCode =
-      sourceCode.slice(0, adjustedPos) +
-      jsdoc +
-      "\n" +
-      sourceCode.slice(adjustedPos);
-  }
-
-  if (jsdocUpdates.length > 0) {
-    fs.writeFileSync(sourceFilePath, sourceCode);
-  }
+async function updateSourceFile(
+  sourceFilePath: string,
+  additionalPrompt: string
+) {
+  // Pass the additionalPrompt argument to makeChatGPTRequest
+  const sourceCode = fs.readFileSync(sourceFilePath).toString();
+  const annotatedCode = await makeChatGPTRequest(sourceCode, additionalPrompt);
+  fs.writeFileSync(sourceFilePath, annotatedCode);
   console.log("DONE " + sourceFilePath);
 }
-
 async function main() {
+  // Create a readline interface
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
+  // Prompt the user for an additional prompt
+  const additionalPrompt = await new Promise<string>((resolve) => {
+    rl.question("Are there any additional prompts? ", (answer) => {
+      resolve(answer);
+      rl.close();
+    });
+  });
+
   for (const fileName of process.argv.slice(2)) {
-    //await new Promise<void>((resolve) =>
-    //  rl.question(`Press Enter to process ${fileName}.`, () => {
-    //    resolve();
-    //  })
-    //);
     console.log("considering " + fileName);
     // Use the function to update a TypeScript file
-    await updateSourceFile(fileName);
+    await updateSourceFile(fileName, additionalPrompt);
   }
 }
 main();
