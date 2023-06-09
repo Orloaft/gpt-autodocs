@@ -16,61 +16,59 @@ export const api = new ChatGPTAPI({
   maxModelTokens: 7192, // Must equal maxModelTokens + maxReponseTokens <= 8192
   maxResponseTokens: 1000,
 });
-const MAX_CODE_CHUNK_SIZE = 5000; // Maximum size of each code chunk
+let remainingUpdates = process.env.CHATGPT_UPDATES
+  ? +process.env.CHATGPT_UPDATES
+  : 0;
+function extractSnippet(sourceCode: string, pos: number) {
+  const maxLength = 7192 * 3;
+  const halfLength = Math.floor(maxLength / 2);
+
+  if (sourceCode.length <= maxLength) {
+    return { snippet: sourceCode, updatedPos: pos };
+  }
+
+  let start = pos - halfLength;
+  let end = pos + halfLength;
+
+  if (start < 0) {
+    end -= start;
+    start = 0;
+  }
+
+  if (end > sourceCode.length) {
+    const diff = end - sourceCode.length;
+    start -= diff;
+    end = sourceCode.length;
+    if (start < 0) {
+      start = 0;
+    }
+  }
+
+  return { snippet: sourceCode.substring(start, end), updatedPos: pos - start };
+}
+const promiseQueue: Array<() => Promise<{ pos: number; doc: string } | null>> =
+  [];
+
 async function makeChatGPTRequest(
   sourceCode: string,
-  additionalPrompt: string
+  additionalPrompt: string,
+  pos: number
 ): Promise<string> {
+  const { snippet, updatedPos } = extractSnippet(sourceCode, pos);
   // Combine the default prompt with the additional prompt
-  const prompt = `please generate a relevant comment for each <comment here> tag in provided code and return a re-written version of the code where each tag is replaced with the corresponding comment.Do not add any additional words before the code. ${additionalPrompt}`;
+  const prompt = `provide only insightful comment to replace the <comment here> tag at index${updatedPos}. ${additionalPrompt}`;
   let writeLength = 0;
-  try {
-    // Split the source code into smaller chunks
-    const codeChunks: string[] = [];
-    let chunkStart = 0;
-    while (chunkStart < sourceCode.length) {
-      const chunkEnd = Math.min(
-        chunkStart + MAX_CODE_CHUNK_SIZE,
-        sourceCode.length
-      );
-      const codeChunk = sourceCode.substring(chunkStart, chunkEnd);
-      codeChunks.push(codeChunk);
-      chunkStart = chunkEnd;
-    }
 
-    // Process each code chunk separately
-    const responsePromises = codeChunks.map(async (chunk) => {
-      const response = await api.sendMessage(prompt, {
-        systemMessage: `this is the provided code:${chunk}`,
-        onProgress(partialResponse) {
-          let output = partialResponse.text;
-          let newOutput = output.substring(writeLength);
-          writeLength = output.length;
-          process.stdout.write(newOutput);
-        },
-      });
-      return response.text;
-    });
-
-    // Wait for all responses
-    const responses = await Promise.all(responsePromises);
-
-    // Concatenate the responses
-    let annotatedCode = responses.join("");
-
-    // Remove the introductory text
-    const codeBlockMarker = "```";
-    const languageMarkerIndex = annotatedCode.indexOf(codeBlockMarker);
-    if (languageMarkerIndex !== -1) {
-      const start = languageMarkerIndex + codeBlockMarker.length;
-      annotatedCode = annotatedCode.substring(start);
-    }
-
-    return annotatedCode;
-  } catch (error) {
-    console.error("ChatGPT request failed:", error);
-    return ""; // Return an empty string if the request fails
-  }
+  const response = await api.sendMessage(prompt, {
+    systemMessage: `work on this code:${snippet}`,
+    onProgress(partialResponse) {
+      let output = partialResponse.text;
+      let newOutput = output.substring(writeLength);
+      writeLength = output.length;
+      process.stdout.write(newOutput);
+    },
+  });
+  return response.text;
 }
 
 async function updateSourceFile(
@@ -79,8 +77,44 @@ async function updateSourceFile(
 ) {
   // Pass the additionalPrompt argument to makeChatGPTRequest
   const sourceCode = fs.readFileSync(sourceFilePath).toString();
-  const annotatedCode = await makeChatGPTRequest(sourceCode, additionalPrompt);
-  fs.writeFileSync(sourceFilePath, annotatedCode);
+  promiseQueue.length = 0;
+  let index: number = sourceCode.indexOf("<comment here>");
+  while (index != -1) {
+    let currentIndex = index;
+    promiseQueue.push(async () => {
+      const doc = await makeChatGPTRequest(sourceCode, additionalPrompt, index);
+      return { pos: currentIndex, doc: doc };
+    });
+    index = sourceCode.indexOf("<comment here>", index + 1);
+    remainingUpdates++;
+  }
+
+  const docUpdates: any[] = [];
+
+  for (const p of promiseQueue) {
+    if (remainingUpdates > 0) {
+      const update = await p();
+      if (update) {
+        docUpdates.push(update);
+        remainingUpdates--;
+      }
+    }
+  }
+
+  let updatedCode: string = sourceCode;
+  let offset: number = 0;
+  for (let i = 0; i < docUpdates.length; i++) {
+    if (docUpdates[i]) {
+      let index: number = docUpdates[i].pos + offset;
+      updatedCode =
+        updatedCode.slice(0, index) +
+        docUpdates[i].doc +
+        updatedCode.slice(index + "<comment here>".length);
+      offset += docUpdates[i].doc.length - "<comment here>".length;
+    }
+  }
+
+  fs.writeFileSync(sourceFilePath, updatedCode);
   console.log("DONE " + sourceFilePath);
 }
 async function main() {
