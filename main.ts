@@ -8,33 +8,46 @@ if (!process.env.CHATGPT_API_KEY) {
   );
 }
 
+// Initialize the ChatGPTAPI with the provided API key and completion parameters
 export const api = new ChatGPTAPI({
   apiKey: process.env.CHATGPT_API_KEY,
   completionParams: {
     model: "gpt-4",
   },
-  maxModelTokens: 7192, // Must equal maxModelTokens + maxReponseTokens <= 8192
+  maxModelTokens: 7192,
   maxResponseTokens: 1000,
 });
+
+// Set the remaining updates based on the environment variable
 let remainingUpdates = process.env.CHATGPT_UPDATES
   ? +process.env.CHATGPT_UPDATES
   : 0;
+
+/**
+ * Extracts a snippet of text from the source code centered around the given position.
+ * @param sourceCode The source code to extract the snippet from.
+ * @param pos The position around which to center the snippet.
+ * @returns An object containing the extracted snippet and the updated position.
+ */
 function extractSnippet(sourceCode: string, pos: number) {
   const maxLength = 7192 * 3;
   const halfLength = Math.floor(maxLength / 2);
 
+  // If the source code is shorter than the maximum length,
+  // return the entire source code and the original position
   if (sourceCode.length <= maxLength) {
     return { snippet: sourceCode, updatedPos: pos };
   }
 
+  // Calculate the start and end positions of the snippet
   let start = pos - halfLength;
   let end = pos + halfLength;
 
+  // Adjust the start and end positions if they are out of bounds
   if (start < 0) {
     end -= start;
     start = 0;
   }
-
   if (end > sourceCode.length) {
     const diff = end - sourceCode.length;
     start -= diff;
@@ -44,30 +57,37 @@ function extractSnippet(sourceCode: string, pos: number) {
     }
   }
 
+  // Return the extracted snippet and the updated position
   return { snippet: sourceCode.substring(start, end), updatedPos: pos - start };
 }
-const promiseQueue: Array<() => Promise<{ pos: number; doc: string } | null>> =
-  [];
 
+/**
+ * Makes a request to the ChatGPT API to generate a comment for the given position in the source code.
+ * @param sourceCode The source code to generate a comment for.
+ * @param additionalPrompt An additional prompt to provide to the ChatGPT API.
+ * @param pos The position in the source code to generate a comment for.
+ * @returns A promise that resolves with the generated comment.
+ */
 async function makeChatGPTRequest(
   sourceCode: string,
   additionalPrompt: string,
   pos: number
 ): Promise<string> {
   const { snippet, updatedPos } = extractSnippet(sourceCode, pos);
-  // Combine the default prompt with the additional prompt
-  const prompt = `provide only insightful comment to replace the <comment here> tag at index${updatedPos}. ${additionalPrompt}`;
+  const prompt = `provide only insightful comment to replace the <comment here> tag at index ${updatedPos}. ${additionalPrompt}`;
+
   let writeLength = 0;
 
   const response = await api.sendMessage(prompt, {
-    systemMessage: `work on this code:${snippet}`,
+    systemMessage: `work on this code:\n${snippet}`,
     onProgress(partialResponse) {
-      let output = partialResponse.text;
-      let newOutput = output.substring(writeLength);
+      const output = partialResponse.text;
+      const newOutput = output.substring(writeLength);
       writeLength = output.length;
       process.stdout.write(newOutput);
     },
   });
+
   return response.text;
 }
 
@@ -75,12 +95,14 @@ async function updateSourceFile(
   sourceFilePath: string,
   additionalPrompt: string
 ) {
-  // Pass the additionalPrompt argument to makeChatGPTRequest
   const sourceCode = fs.readFileSync(sourceFilePath).toString();
-  promiseQueue.length = 0;
-  let index: number = sourceCode.indexOf("<comment here>");
-  while (index != -1) {
-    let currentIndex = index;
+  const promiseQueue: Array<
+    () => Promise<{ pos: number; doc: string } | null>
+  > = [];
+  let index = sourceCode.indexOf("<comment here>");
+
+  while (index !== -1) {
+    const currentIndex = index;
     promiseQueue.push(async () => {
       const doc = await makeChatGPTRequest(sourceCode, additionalPrompt, index);
       return { pos: currentIndex, doc: doc };
@@ -89,7 +111,7 @@ async function updateSourceFile(
     remainingUpdates++;
   }
 
-  const docUpdates: any[] = [];
+  const docUpdates: Array<{ pos: number; doc: string }> = [];
 
   for (const p of promiseQueue) {
     if (remainingUpdates > 0) {
@@ -101,30 +123,29 @@ async function updateSourceFile(
     }
   }
 
-  let updatedCode: string = sourceCode;
-  let offset: number = 0;
-  for (let i = 0; i < docUpdates.length; i++) {
-    if (docUpdates[i]) {
-      let index: number = docUpdates[i].pos + offset;
-      updatedCode =
-        updatedCode.slice(0, index) +
-        docUpdates[i].doc +
-        updatedCode.slice(index + "<comment here>".length);
-      offset += docUpdates[i].doc.length - "<comment here>".length;
-    }
+  let updatedCode = sourceCode;
+  let offset = 0;
+
+  for (const update of docUpdates) {
+    const { pos, doc } = update;
+    const currentIndex = pos + offset;
+    updatedCode =
+      updatedCode.slice(0, currentIndex) +
+      doc +
+      updatedCode.slice(currentIndex + "<comment here>".length);
+    offset += doc.length - "<comment here>".length;
   }
 
   fs.writeFileSync(sourceFilePath, updatedCode);
   console.log("DONE " + sourceFilePath);
 }
+
 async function main() {
-  // Create a readline interface
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
-  // Prompt the user for an additional prompt
   const additionalPrompt = await new Promise<string>((resolve) => {
     rl.question("Are there any additional prompts? ", (answer) => {
       resolve(answer);
@@ -133,9 +154,9 @@ async function main() {
   });
 
   for (const fileName of process.argv.slice(2)) {
-    console.log("considering " + fileName);
-    // Use the function to update a TypeScript file
+    console.log("Considering " + fileName);
     await updateSourceFile(fileName, additionalPrompt);
   }
 }
+
 main();
