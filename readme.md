@@ -56,7 +56,7 @@ To use gpt-autodocs, follow these steps:
 2. Run the annotator:
 
 ```shell
-yarn start path_to_file
+yarn start <path_to_file>
 ```
 
 - The tool will prompt you for additional prompts. Provide any specific instructions or prompts to customize the comments generated.
