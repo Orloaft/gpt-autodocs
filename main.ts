@@ -146,17 +146,36 @@ async function main() {
     output: process.stdout,
   });
 
-  const additionalPrompt = await new Promise<string>((resolve) => {
-    rl.question("Are there any additional prompts? ", (answer) => {
-      resolve(answer);
-      rl.close();
-    });
+  const commentAction = await new Promise<string>((resolve) => {
+    rl.question(
+      "Would you like to improve existing comments or add new comments? (improve/add) ",
+      (answer) => {
+        resolve(answer);
+      }
+    );
   });
+  console.log(commentAction);
+  if (commentAction === "add") {
+    const additionalPrompt = await new Promise<string>((resolve) => {
+      rl.question("Are there any additional prompts? ", (answer) => {
+        resolve(answer);
+        rl.close();
+      });
+    });
 
-  for (const fileName of process.argv.slice(2)) {
-    console.log("Considering " + fileName);
-    await updateSourceFile(fileName, additionalPrompt);
+    for (const fileName of process.argv.slice(2)) {
+      console.log("Considering " + fileName);
+      await updateSourceFile(fileName, additionalPrompt);
+    }
+  } else if (commentAction === "improve") {
+  } else {
+    process.exit(1);
   }
 }
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 
 main();
